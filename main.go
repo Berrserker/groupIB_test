@@ -39,7 +39,7 @@ func main() {
 
 	go func() {
 		if err := server.ListenAndServe(); err != nil {
-			// handle err
+			log.Fatal(err)
 		}
 	}()
 
