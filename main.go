@@ -113,7 +113,6 @@ func (s *Service) handler(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			resp.Text(http.StatusNotFound, "")
 		case ErrNoQueueForKey:
 			resp.Text(http.StatusNotFound, "")
 		default:
@@ -141,14 +140,19 @@ type Client struct {
 }
 
 type ClientQueue struct {
+	sync.Mutex
 	clients []*Client
 }
 
 func (q *ClientQueue) Push(v *Client) {
+	q.Lock()
+	defer q.Unlock()
 	q.clients = append(q.clients, v)
 }
 
 func (q *ClientQueue) Pop() (*Client, bool) {
+	q.Lock()
+	defer q.Unlock()
 	if len(q.clients) > 0 {
 		result := q.clients[0]
 		q.clients = q.clients[1:]
@@ -160,14 +164,19 @@ func (q *ClientQueue) Pop() (*Client, bool) {
 }
 
 type ValuesQueue struct {
+	sync.Mutex
 	values []string
 }
 
 func (q *ValuesQueue) Push(v string) {
+	q.Lock()
+	defer q.Unlock()
 	q.values = append(q.values, v)
 }
 
 func (q *ValuesQueue) Pop() (string, bool) {
+	q.Lock()
+	defer q.Unlock()
 	if len(q.values) > 0 {
 		result := q.values[0]
 		q.values = q.values[1:]
@@ -187,11 +196,13 @@ type Service struct {
 }
 
 func (s *Service) InsertValue(key, value string) {
+	s.Lock()
 	queue, ok := s.values[key]
 	if !ok {
 		s.values[key] = &ValuesQueue{}
 		queue = s.values[key]
 	}
+	s.Unlock()
 
 	queue.Push(value)
 
@@ -202,10 +213,14 @@ var ErrNoQueueForKey = errors.New("ErrNoQueueForKey")
 var ErrEmptyQueue = errors.New("ErrEmptyQueue")
 
 func (s *Service) ExtractValue(key string) (string, error) {
+	s.Lock()
 	queue, ok := s.values[key]
 	if !ok {
+		s.Unlock()
+
 		return "", ErrNoQueueForKey
 	}
+	s.Unlock()
 
 	results, ok := queue.Pop()
 	if !ok {
@@ -217,12 +232,12 @@ func (s *Service) ExtractValue(key string) (string, error) {
 
 func (s *Service) AddWaiting(key string, ctx context.Context) chan struct{} {
 	s.Lock()
-	defer s.Unlock()
 	queue, ok := s.clients[key]
 	if !ok {
 		s.clients[key] = &ClientQueue{}
 		queue = s.clients[key]
 	}
+	s.Unlock()
 
 	notify := make(chan struct{}, 2)
 	queue.Push(&Client{
@@ -234,10 +249,14 @@ func (s *Service) AddWaiting(key string, ctx context.Context) chan struct{} {
 }
 
 func (s *Service) NotifyWaiter(key string) {
+	s.Lock()
 	queue, ok := s.clients[key]
 	if !ok {
+		s.Unlock()
+
 		return
 	}
+	s.Unlock()
 
 	client, ok := queue.Pop()
 	if !ok {
@@ -250,6 +269,7 @@ func (s *Service) NotifyWaiter(key string) {
 	case client.Response <- struct{}{}:
 		close(client.Response)
 	}
+
 	return
 }
 
