@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/trace"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +20,18 @@ import (
 var port = flag.String("port", "8080", "port to start")
 
 func main() {
+	f, err := os.Create("trace.out")
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+
+	err = trace.Start(f)
+	if err != nil {
+		panic(err)
+	}
+	defer trace.Stop()
+
 	flag.Parse()
 	fmt.Printf("Starting server at port %s\n", *port)
 
@@ -32,8 +45,24 @@ func main() {
 		values:  make(map[string]*ValuesQueue),
 	}
 	go service.RunWatcher()
+	
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		resp := Response{w}
 
-	http.HandleFunc("/", service.handler)
+		keys := strings.Split(r.URL.Path, "/")
+		if len(keys) != 2 {
+			resp.Text(http.StatusBadRequest, "")
+		}
+
+		switch r.Method {
+		case "GET":
+			service.Get(w, r)
+		case "PUT":
+			service.Put(w, r)
+		default:
+			resp.Text(http.StatusNotFound, "")
+		}
+	})
 
 	server := &http.Server{Addr: fmt.Sprintf(":%s", *port)}
 
@@ -47,9 +76,9 @@ func main() {
 	signal.Notify(stop, os.Interrupt)
 	<-stop
 
-	if err := server.Shutdown(ctx); err != nil {
-		log.Fatal(err)
-	}
+	//if err := server.Shutdown(ctx); err != nil {
+	//	log.Fatal(err)
+	//}
 }
 
 type Response struct {
@@ -67,7 +96,7 @@ func (r *Response) Text(code int, body string) {
 	}
 }
 
-func (s *Service) handler(w http.ResponseWriter, r *http.Request) {
+func (s *Service) Put(w http.ResponseWriter, r *http.Request) {
 	resp := Response{w}
 
 	keys := strings.Split(r.URL.Path, "/")
@@ -77,61 +106,99 @@ func (s *Service) handler(w http.ResponseWriter, r *http.Request) {
 
 	key := keys[1]
 
-	switch r.Method {
-	case "GET":
-		timeouts, ok := r.URL.Query()["timeout"]
-		timeout := "0"
-		if ok {
-			timeout = timeouts[0]
-		}
+	values, ok := r.URL.Query()["v"]
+	value := "default message"
+	if ok {
+		value = values[0]
+	}
 
-		value, err := s.ExtractValue(key)
-		switch err {
-		case nil:
-			resp.Text(http.StatusOK, value)
-		case ErrEmptyQueue:
-			if timeout != "" {
-				dur, err := strconv.Atoi(timeout)
-				if err != nil {
-					resp.Text(http.StatusBadRequest, "")
-				}
+	s.InsertValue(key, value)
+}
 
-				dd := time.Duration(dur)
-				clientCtx, cancel := context.WithTimeout(s.ctx, dd*time.Second)
-				defer cancel()
-				notify := s.AddWaiting(key, clientCtx)
-				select {
-				case <-clientCtx.Done():
+func (s *Service) Get(w http.ResponseWriter, r *http.Request) {
+	resp := Response{w}
+
+	keys := strings.Split(r.URL.Path, "/")
+	if len(keys) != 2 {
+		resp.Text(http.StatusBadRequest, "")
+	}
+
+	key := keys[1]
+
+	timeouts, ok := r.URL.Query()["timeout"]
+	timeout := "0"
+	if ok {
+		timeout = timeouts[0]
+	}
+
+	value, err := s.ExtractValue(key)
+	switch err {
+	case nil:
+		resp.Text(http.StatusOK, value)
+	case ErrEmptyQueue:
+		if timeout != "" {
+			dur, err := strconv.Atoi(timeout)
+			if err != nil {
+				resp.Text(http.StatusBadRequest, "")
+			}
+
+			dd := time.Duration(dur)
+			clientCtx, cancel := context.WithTimeout(s.ctx, dd*time.Second)
+			defer cancel()
+			notify := s.AddWaiting(key, clientCtx)
+			select {
+			case <-r.Context().Done():
+				resp.Text(http.StatusNotFound, "")
+				cancel()
+			case <-clientCtx.Done():
+				resp.Text(http.StatusNotFound, "")
+			case <-notify:
+				value, err := s.ExtractValue(key)
+				switch err {
+				case nil:
+					resp.Text(http.StatusOK, value)
+				default:
 					resp.Text(http.StatusNotFound, "")
-				case <-notify:
-					value, err := s.ExtractValue(key)
-					switch err {
-					case nil:
-						resp.Text(http.StatusOK, value)
-					default:
-						resp.Text(http.StatusNotFound, "")
-					}
 				}
 			}
-		case ErrNoQueueForKey:
-			resp.Text(http.StatusNotFound, "")
-		default:
-			resp.Text(http.StatusInternalServerError, "")
-			log.Fatal(err)
 		}
-	case "PUT":
-		values, ok := r.URL.Query()["v"]
-		value := "default message"
-		if ok {
-			value = values[0]
-		}
-
-		s.InsertValue(key, value)
+	case ErrNoQueueForKey:
+		resp.Text(http.StatusNotFound, "")
 	default:
-		if len(keys) != 2 {
-			resp.Text(http.StatusNotFound, "")
-		}
+		resp.Text(http.StatusInternalServerError, "")
+		log.Fatal(err)
 	}
+}
+
+type Chunk struct {
+	Data interface{}
+	Next *Chunk
+}
+
+type Queue struct {
+	len int
+	sync.Mutex
+	head, tail *Chunk
+}
+
+func (q *Queue) Push(v interface{}) {
+	q.Lock()
+	defer q.Unlock()
+
+	chunk := &Chunk{
+		Data: v,
+	}
+
+	if q.tail != nil {
+		q.tail.Next = chunk
+	}
+	q.tail = chunk
+
+	if q.len == 0 {
+		q.head = q.tail
+	}
+
+	q.len += 1
 }
 
 type Client struct {
@@ -140,51 +207,51 @@ type Client struct {
 }
 
 type ClientQueue struct {
-	sync.Mutex
-	clients []*Client
-}
-
-func (q *ClientQueue) Push(v *Client) {
-	q.Lock()
-	defer q.Unlock()
-	q.clients = append(q.clients, v)
+	Queue
 }
 
 func (q *ClientQueue) Pop() (*Client, bool) {
 	q.Lock()
 	defer q.Unlock()
-	if len(q.clients) > 0 {
-		result := q.clients[0]
-		q.clients = q.clients[1:]
 
-		return result, true
+	if q.head == nil {
+		return nil, false
 	}
 
-	return nil, false
+	client, ok := q.head.Data.(*Client)
+	if q.head.Next != nil {
+		q.head = q.head.Next
+	} else {
+		q.head = nil
+	}
+
+	q.len -= 1
+
+	return client, ok
 }
 
 type ValuesQueue struct {
-	sync.Mutex
-	values []string
+	Queue
 }
 
-func (q *ValuesQueue) Push(v string) {
+func (q *ValuesQueue) Pop() (*string, bool) {
 	q.Lock()
 	defer q.Unlock()
-	q.values = append(q.values, v)
-}
 
-func (q *ValuesQueue) Pop() (string, bool) {
-	q.Lock()
-	defer q.Unlock()
-	if len(q.values) > 0 {
-		result := q.values[0]
-		q.values = q.values[1:]
-
-		return result, true
+	if q.head == nil {
+		return nil, false
 	}
 
-	return "", false
+	client, ok := q.head.Data.(*string)
+	if q.head.Next != nil {
+		q.head = q.head.Next
+	} else {
+		q.head = nil
+	}
+
+	q.len -= 1
+
+	return client, ok
 }
 
 type Service struct {
@@ -204,7 +271,7 @@ func (s *Service) InsertValue(key, value string) {
 	}
 	s.Unlock()
 
-	queue.Push(value)
+	queue.Push(&value)
 
 	s.watcher <- key
 }
@@ -227,7 +294,7 @@ func (s *Service) ExtractValue(key string) (string, error) {
 		return "", ErrEmptyQueue
 	}
 
-	return results, nil
+	return *results, nil
 }
 
 func (s *Service) AddWaiting(key string, ctx context.Context) chan struct{} {
