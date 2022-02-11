@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"runtime/trace"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,18 +19,6 @@ import (
 var port = flag.String("port", "8080", "port to start")
 
 func main() {
-	f, err := os.Create("trace.out")
-	if err != nil {
-		panic(err)
-	}
-	defer f.Close()
-
-	err = trace.Start(f)
-	if err != nil {
-		panic(err)
-	}
-	defer trace.Stop()
-
 	flag.Parse()
 	fmt.Printf("Starting server at port %s\n", *port)
 
@@ -45,7 +32,7 @@ func main() {
 		values:  make(map[string]*ValuesQueue),
 	}
 	go service.RunWatcher()
-	
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		resp := Response{w}
 
@@ -76,9 +63,9 @@ func main() {
 	signal.Notify(stop, os.Interrupt)
 	<-stop
 
-	//if err := server.Shutdown(ctx); err != nil {
-	//	log.Fatal(err)
-	//}
+	if err := server.Shutdown(ctx); err != nil {
+		log.Fatal(err)
+	}
 }
 
 type Response struct {
@@ -255,7 +242,7 @@ func (q *ValuesQueue) Pop() (*string, bool) {
 }
 
 type Service struct {
-	sync.Mutex
+	sync.RWMutex
 	ctx     context.Context
 	watcher chan string
 	clients map[string]*ClientQueue
@@ -280,14 +267,14 @@ var ErrNoQueueForKey = errors.New("ErrNoQueueForKey")
 var ErrEmptyQueue = errors.New("ErrEmptyQueue")
 
 func (s *Service) ExtractValue(key string) (string, error) {
-	s.Lock()
+	s.RLock()
 	queue, ok := s.values[key]
 	if !ok {
-		s.Unlock()
+		s.RUnlock()
 
 		return "", ErrNoQueueForKey
 	}
-	s.Unlock()
+	s.RUnlock()
 
 	results, ok := queue.Pop()
 	if !ok {
@@ -316,14 +303,14 @@ func (s *Service) AddWaiting(key string, ctx context.Context) chan struct{} {
 }
 
 func (s *Service) NotifyWaiter(key string) {
-	s.Lock()
+	s.RLock()
 	queue, ok := s.clients[key]
 	if !ok {
-		s.Unlock()
+		s.RUnlock()
 
 		return
 	}
-	s.Unlock()
+	s.RUnlock()
 
 	client, ok := queue.Pop()
 	if !ok {
