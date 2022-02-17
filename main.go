@@ -118,11 +118,17 @@ func (s *Service) Get(w http.ResponseWriter, r *http.Request) {
 		timeout = timeouts[0]
 	}
 
-	value, err := s.ExtractValue(key)
-	switch err {
-	case nil:
-		resp.Text(http.StatusOK, value)
-	case ErrEmptyQueue:
+	extractFromQueue := func () {
+		value, err := s.ExtractValue(key)
+		switch err {
+		case nil:
+			resp.Text(http.StatusOK, value)
+		default:
+			resp.Text(http.StatusNotFound, "")
+		}
+	}
+
+	collect := func() {
 		if timeout != "" {
 			dur, err := strconv.Atoi(timeout)
 			if err != nil {
@@ -140,15 +146,17 @@ func (s *Service) Get(w http.ResponseWriter, r *http.Request) {
 			case <-clientCtx.Done():
 				resp.Text(http.StatusNotFound, "")
 			case <-notify:
-				value, err := s.ExtractValue(key)
-				switch err {
-				case nil:
-					resp.Text(http.StatusOK, value)
-				default:
-					resp.Text(http.StatusNotFound, "")
-				}
+				extractFromQueue()
 			}
 		}
+	}
+
+	value, err := s.TryRead(key)
+	switch err {
+	case nil:
+		resp.Text(http.StatusOK, value)
+	case ErrEmptyQueue:
+		collect()
 	case ErrNoQueueForKey:
 		resp.Text(http.StatusNotFound, "")
 	default:
@@ -168,9 +176,16 @@ type Queue struct {
 	head, tail *Chunk
 }
 
+func (q *Queue) L() (int, ) {
+	q.Lock()
+	l := q.len
+	q.Unlock()
+
+	return l
+}
+
 func (q *Queue) Push(v interface{}) {
 	q.Lock()
-	defer q.Unlock()
 
 	chunk := &Chunk{
 		Data: v,
@@ -186,6 +201,7 @@ func (q *Queue) Push(v interface{}) {
 	}
 
 	q.len += 1
+	q.Unlock()
 }
 
 type Client struct {
@@ -199,9 +215,11 @@ type ClientQueue struct {
 
 func (q *ClientQueue) Pop() (*Client, bool) {
 	q.Lock()
-	defer q.Unlock()
+
 
 	if q.head == nil {
+		q.Unlock()
+
 		return nil, false
 	}
 
@@ -214,6 +232,7 @@ func (q *ClientQueue) Pop() (*Client, bool) {
 
 	q.len -= 1
 
+	q.Unlock()
 	return client, ok
 }
 
@@ -223,9 +242,10 @@ type ValuesQueue struct {
 
 func (q *ValuesQueue) Pop() (*string, bool) {
 	q.Lock()
-	defer q.Unlock()
 
 	if q.head == nil {
+		q.Unlock()
+
 		return nil, false
 	}
 
@@ -238,6 +258,7 @@ func (q *ValuesQueue) Pop() (*string, bool) {
 
 	q.len -= 1
 
+	q.Unlock()
 	return client, ok
 }
 
@@ -266,6 +287,16 @@ func (s *Service) InsertValue(key, value string) {
 var ErrNoQueueForKey = errors.New("ErrNoQueueForKey")
 var ErrEmptyQueue = errors.New("ErrEmptyQueue")
 
+func (s *Service) TryRead(key string) (string, error) {
+	s.RLock()
+	client, ok := s.clients[key]
+	s.RUnlock()
+	if !ok || client.L() == 0 {
+		return s.ExtractValue(key)
+	}
+
+	return "", ErrEmptyQueue
+}
 func (s *Service) ExtractValue(key string) (string, error) {
 	s.RLock()
 	queue, ok := s.values[key]
